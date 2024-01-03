@@ -92,7 +92,7 @@ def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, 
         noise_mask = latent["noise_mask"]
 
     callback = latent_preview.prepare_callback(model, steps)
-    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    #disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
     samples = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
                                   denoise=denoise, disable_noise=disable_noise, start_step=start_step, last_step=last_step,
                                   force_full_denoise=force_full_denoise, noise_mask=noise_mask, callback=callback, disable_pbar=True, seed=seed)
@@ -148,7 +148,7 @@ class KSamplerRAVE:
         if pad_grid:
             pad = 1
         
-        print("RAVE sampling with %d frames" % (batch_length))
+        print("RAVE sampling with %d frames (%d grids)" % (batch_length, math.ceil(batch_length / (grid_size ** 2))))
         
         # check pos and neg for controlnets
         controlnet_exist = False
@@ -181,6 +181,7 @@ class KSamplerRAVE:
         # iterate steps
         seed = noise_seed
         total_steps = min(steps, end_at_step) - start_at_step
+        pbar = comfy.utils.ProgressBar(total_steps)
         for step in trange(total_steps, delay=1):
             # grid latents in random arrangement
             latent = grid_compose(latent.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
@@ -199,6 +200,7 @@ class KSamplerRAVE:
             # ungrid latents and increment seed to shuffle grids with a different arrangement on the next step
             latent = grid_decompose(result[0]["samples"].movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
             seed += 1
+            pbar.update(1)
         
         # restore original controlnet images (may cause issues if job is interrupted)
         if controlnet_exist:
