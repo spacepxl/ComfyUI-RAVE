@@ -12,7 +12,7 @@ import comfy.utils
 import latent_preview
 
 
-def grid_compose(images, x_dim, random, rs, pad):
+def grid_compose(images, x_dim, random, rs, pad=0):
     
     grid_size = x_dim * x_dim
     batch_size = math.ceil(images.size(dim=0) / grid_size)
@@ -32,40 +32,36 @@ def grid_compose(images, x_dim, random, rs, pad):
         offset = i * grid_size
         img_batch = shuffled_images[offset:offset+grid_size]
         
-        grid = make_grid(img_batch.movedim(-1,1), nrow=x_dim, padding=0).movedim(0,2)[None,]
+        grid = make_grid(img_batch.movedim(-1,1), nrow=x_dim, padding=pad).movedim(0,2)[None,]
+        
+        if pad > 0:
+            grid = grid[:, pad:-pad, pad:-pad, :]
+            
         batch_tensor.append(grid)
     
     batch_tensor = torch.cat(batch_tensor, 0)
     
-    if pad:
-        v = images.size(1)
-        u = images.size(2)
-        batch_tensor[:, v::v, :, :] = 0
-        batch_tensor[:, :, u::u, :] = 0
-    
     return batch_tensor
 
 
-def grid_decompose(images, x_dim, random, rs, pad):
+def grid_decompose(images, x_dim, random, rs, pad=0):
     
     grid_size = x_dim * x_dim
     batch_size = images.size(0) * grid_size
     
-    orig_w = int(images.size(1) / x_dim)
-    orig_h = int(images.size(2) / x_dim)
+    padding = pad * (x_dim - 1)
+    
+    orig_w = int((images.size(1) - padding) / x_dim)
+    orig_h = int((images.size(2) - padding) / x_dim)
     
     batch_tensor = []
     
     for i in range(images.size(0)):
         grid = images[i]
         
-        if pad:
-            grid[orig_w::orig_w, :, :] = grid[orig_w + 1::orig_w, :, :] # * 1.5 - grid[orig_w + 2::orig_w, :, :] * 0.5
-            grid[:, orig_h::orig_h, :] = grid[:, orig_h + 1::orig_h, :] # * 1.5 - grid[:, orig_h + 2::orig_h, :] * 0.5
-        
         for j in range (grid_size):
-            w0 = int(math.floor(j / x_dim) * orig_w)
-            h0 = int((j % x_dim) * orig_h)
+            w0 = int(math.floor(j / x_dim) * (orig_w + pad))
+            h0 = int((j % x_dim) * orig_h) + ((j % x_dim) * pad)
             w1 = w0 + orig_w
             h1 = h0 + orig_h
             img = grid[w0:w1, h0:h1]
@@ -148,6 +144,10 @@ class KSamplerRAVE:
     def sample(self, model, grid_size, pad_grid, noise_seed, add_noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step):
         latent = latent_image["samples"].clone()
         batch_length = latent.size(0)
+        pad = 0
+        if pad_grid:
+            pad = 1
+        
         print("RAVE sampling with %d frames" % (batch_length))
         
         # check pos and neg for controlnets
@@ -183,12 +183,12 @@ class KSamplerRAVE:
         total_steps = min(steps, end_at_step) - start_at_step
         for step in trange(total_steps, delay=1):
             # grid latents in random arrangement
-            latent = grid_compose(latent.movedim(1,3), grid_size, True, seed, pad_grid).movedim(-1,1)
+            latent = grid_compose(latent.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
             
             # grid controlnet images and apply
             if controlnet_exist:
                 for i in range(len(control_objs)):
-                    ctrl_img = grid_compose(control_images[i].movedim(1,3), grid_size, True, seed, pad_grid).movedim(-1,1)
+                    ctrl_img = grid_compose(control_images[i].movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
                     control_objs[i].set_cond_hint(ctrl_img, control_objs[i].strength, control_objs[i].timestep_percent_range)
             
             # sample 1 step
@@ -197,7 +197,7 @@ class KSamplerRAVE:
             result = common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, {"samples":latent}, denoise=1.0, disable_noise=True, start_step=start, last_step=end, force_full_denoise=False)
             
             # ungrid latents and increment seed to shuffle grids with a different arrangement on the next step
-            latent = grid_decompose(result[0]["samples"].movedim(1,3), grid_size, True, seed, pad_grid).movedim(-1,1)
+            latent = grid_decompose(result[0]["samples"].movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
             seed += 1
         
         # restore original controlnet images (may cause issues if job is interrupted)
@@ -226,7 +226,11 @@ class ImageGridCompose:
     CATEGORY = "RAVE/Image"
     
     def compose(self, images, x_dim, pad_grid, random, rs):
-        return (grid_compose(images, x_dim, random, rs, pad_grid),)
+        pad = 0
+        if pad_grid:
+            pad = 1
+        
+        return (grid_compose(images, x_dim, random, rs, pad*8),)
 
 
 class ImageGridDecompose:
@@ -247,7 +251,11 @@ class ImageGridDecompose:
     CATEGORY = "RAVE/Image"
     
     def decompose(self, images, x_dim, pad_grid, random, rs):
-        return (grid_decompose(images, x_dim, random, rs, pad_grid),)
+        pad = 0
+        if pad_grid:
+            pad = 1
+        
+        return (grid_decompose(images, x_dim, random, rs, pad*8),)
 
 
 class LatentGridCompose:
@@ -268,7 +276,11 @@ class LatentGridCompose:
     CATEGORY = "RAVE/Latent"
     
     def compose(self, latents, x_dim, pad_grid, random, rs):
-        t = grid_compose(latents["samples"].movedim(1,3), x_dim, random, rs, pad_grid).movedim(-1,1)
+        pad = 0
+        if pad_grid:
+            pad = 1
+        
+        t = grid_compose(latents["samples"].movedim(1,3), x_dim, random, rs, pad).movedim(-1,1)
         
         return ({"samples":t}, )
 
@@ -291,7 +303,11 @@ class LatentGridDecompose:
     CATEGORY = "RAVE/Latent"
     
     def decompose(self, latents, x_dim, pad_grid, random, rs):
-        t = grid_decompose(latents["samples"].movedim(1,3), x_dim, random, rs, pad_grid).movedim(-1,1)
+        pad = 0
+        if pad_grid:
+            pad = 1
+        
+        t = grid_decompose(latents["samples"].movedim(1,3), x_dim, random, rs, pad).movedim(-1,1)
         
         return ({"samples":t}, )
 
