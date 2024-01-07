@@ -144,6 +144,12 @@ class KSamplerRAVE:
     def sample(self, model, grid_size, pad_grid, noise_seed, add_noise, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, start_at_step, end_at_step):
         latent = latent_image["samples"].clone()
         batch_length = latent.size(0)
+        
+        mask_enabled = False
+        if "noise_mask" in latent_image:
+            mask_enabled = True
+            noise_mask = comfy.utils.repeat_to_batch_size(latent_image["noise_mask"].clone(), batch_length)
+        
         pad = 0
         if pad_grid:
             pad = 1
@@ -175,6 +181,8 @@ class KSamplerRAVE:
         # add random noise if enabled
         if add_noise:
             noise = comfy.sample.prepare_noise(latent, noise_seed)
+            if mask_enabled:
+                noise = noise * torch.nn.functional.interpolate(noise_mask, size=(noise.size(2), noise.size(3)), mode="bilinear").repeat(1, 4, 1, 1)
             sigma = calc_sigma(model, sampler_name, scheduler, steps, start_at_step, end_at_step)
             latent = latent + noise * sigma
         
@@ -184,7 +192,11 @@ class KSamplerRAVE:
         pbar = comfy.utils.ProgressBar(total_steps)
         for step in trange(total_steps, delay=1):
             # grid latents in random arrangement
-            latent = grid_compose(latent.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
+            grid = {"samples": grid_compose(latent.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)}
+            
+            # grid mask if it exists
+            if mask_enabled:
+                grid["noise_mask"] = grid_compose(noise_mask.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
             
             # grid controlnet images and apply
             if controlnet_exist:
@@ -195,10 +207,16 @@ class KSamplerRAVE:
             # sample 1 step
             start = start_at_step + step
             end = start + 1
-            result = common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, {"samples":latent}, denoise=1.0, disable_noise=True, start_step=start, last_step=end, force_full_denoise=False)
+            result = common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, grid, denoise=1.0, disable_noise=True, start_step=start, last_step=end, force_full_denoise=False)
             
             # ungrid latents and increment seed to shuffle grids with a different arrangement on the next step
             latent = grid_decompose(result[0]["samples"].movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
+            if mask_enabled:
+                grid_diff = torch.max(torch.abs(result[0]["samples"] - grid["samples"]) ** 2, 1, keepdim=True)[0]
+                grid_diff = torch.nn.functional.interpolate(grid_diff, size=(grid_diff.size(2) * 8, grid_diff.size(3) * 8), mode="bilinear")
+                grid_diff = torch.clamp((grid_diff - 0.0001) * 10000, min=0, max=1)
+                noise_mask = torch.maximum(grid_decompose(grid_diff.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1), noise_mask)
+            
             seed += 1
             pbar.update(1)
         
@@ -207,6 +225,8 @@ class KSamplerRAVE:
             for i in range(len(control_objs)):
                 control_objs[i].set_cond_hint(control_images[i], control_objs[i].strength, control_objs[i].timestep_percent_range)
         
+        if mask_enabled:
+            return ({"samples":latent[:batch_length], "noise_mask":noise_mask[:batch_length]}, ) # slice latents to original batch length
         return ({"samples":latent[:batch_length]}, ) # slice latents to original batch length
 
 
