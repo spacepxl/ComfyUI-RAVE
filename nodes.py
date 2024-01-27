@@ -156,26 +156,42 @@ class KSamplerRAVE:
         
         print("RAVE sampling with %d frames (%d grids)" % (batch_length, math.ceil(batch_length / (grid_size ** 2))))
         
-        # check pos and neg for controlnets
+        # check pos and neg for controlnets and masks
         controlnet_exist = False
+        cond_mask_exists = False
         for conditioning in [positive, negative]:
             for t in conditioning:
                 if 'control' in t[1]:
                     controlnet_exist = True
-        
+                if 'mask' in t[1]:
+                    cond_mask_exists = True
+        #check for condition masks and add them to lists
+        cond_masks_pos = []
+        cond_masks_neg = []
+        if cond_mask_exists:
+            for t in positive:
+                cond_mask_pos = t[1]['mask']
+                cond_masks_pos.append(cond_mask_pos)
+            for t in negative:
+                cond_mask_neg = t[1]['mask']
+                cond_masks_neg.append(cond_mask_neg)
+
         # get list of controlnet objs and images
         control_objs = []
         control_images = []
+        control_masks = []
         if controlnet_exist:
             for t in positive:
                 control = t[1]['control']
                 control_objs.append(control)
                 control_images.append(control.cond_hint_original)
-                
+                control_masks.append(control.mask_cond_hint_original)
+
                 prev = control.previous_controlnet
                 while prev != None:
                     control_objs.append(prev)
                     control_images.append(prev.cond_hint_original)
+                    control_masks.append(prev.mask_cond_hint_original)
                     prev = prev.previous_controlnet
         
         # add random noise if enabled
@@ -203,7 +219,22 @@ class KSamplerRAVE:
                 for i in range(len(control_objs)):
                     ctrl_img = grid_compose(control_images[i].movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
                     control_objs[i].set_cond_hint(ctrl_img, control_objs[i].strength, control_objs[i].timestep_percent_range)
-            
+                    # grid controlnet masks and apply
+                    if control_masks[i] is not None:
+                        ctrl_mask = grid_compose(control_masks[i].unsqueeze(1).movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
+                        control_objs[i].set_cond_hint_mask(ctrl_mask)
+
+            # grid condition masks and apply
+            if cond_mask_exists:
+                for i in range(len(cond_masks_pos)):     
+                    cmask_pos = grid_compose(cond_masks_pos[i].unsqueeze(1).movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
+                    cmask_pos = cmask_pos[:, 0, :, :]
+                    positive[i][1]['mask'] = cmask_pos
+                for i in range(len(cond_masks_neg)):      
+                    cmask_neg = grid_compose(cond_masks_neg[i].unsqueeze(1).movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
+                    cmask_neg = cmask_neg[:, 0, :, :]
+                    negative[i][1]['mask'] = cmask_neg
+
             # sample 1 step
             start = start_at_step + step
             end = start + 1
@@ -224,7 +255,17 @@ class KSamplerRAVE:
         if controlnet_exist:
             for i in range(len(control_objs)):
                 control_objs[i].set_cond_hint(control_images[i], control_objs[i].strength, control_objs[i].timestep_percent_range)
-        
+                if control_masks[i] is not None:
+                    control_objs[i].set_cond_hint_mask(control_masks[i])
+                    
+        # restore original condition masks
+        if cond_mask_exists:
+            for i in range(len(cond_masks_pos)):
+                positive[i][1]['mask'] = cond_masks_pos[i]
+            for i in range(len(cond_masks_neg)):
+                negative[i][1]['mask'] = cond_masks_neg[i]
+
+
         if mask_enabled:
             return ({"samples":latent[:batch_length], "noise_mask":noise_mask[:batch_length]}, ) # slice latents to original batch length
         return ({"samples":latent[:batch_length]}, ) # slice latents to original batch length
