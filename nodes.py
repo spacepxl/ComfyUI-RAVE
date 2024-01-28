@@ -143,7 +143,7 @@ class KSamplerRAVE:
                      }
                 }
 
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", )
     FUNCTION = "sample"
 
     CATEGORY = "RAVE"
@@ -156,9 +156,13 @@ class KSamplerRAVE:
         if "noise_mask" in latent_image:
             mask_enabled = True
             noise_mask = latent_image["noise_mask"].clone()
-            noise_mask = comfy.sample.prepare_mask(noise_mask, latent.shape, "cpu")
+            print(noise_mask.shape)
+            noise_mask = comfy.sample.prepare_mask(noise_mask, latent.shape, "cpu")[:, 0, :, :].unsqueeze(1)
+            print(noise_mask.shape)
             noise_mask = (noise_mask > 0).type(noise_mask.dtype)
+            print(noise_mask.shape)
             noise_mask = rave_prepare_mask(noise_mask, latent.shape)[:, 0, :, :].unsqueeze(1)
+            print(noise_mask.shape)
         
         pad = 0
         if pad_grid:
@@ -230,7 +234,7 @@ class KSamplerRAVE:
             
             # grid latent mask if it exists
             if mask_enabled:
-                grid["noise_mask"] = grid_compose(noise_mask.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
+                grid["noise_mask"] = grid_compose(noise_mask.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)[:,0:1,:,:]
             
             # grid controlnet images and apply
             if controlnet_exist:
@@ -285,9 +289,11 @@ class KSamplerRAVE:
                     negative[i][1]['mask'] = cond_masks_neg[i]
 
 
+        out = copy.deepcopy(latent_image)
+        out["samples"] = latent[:batch_length]
         if mask_enabled:
-            return ({"samples":latent[:batch_length], "noise_mask":noise_mask[:batch_length]}, ) # slice latents to original batch length
-        return ({"samples":latent[:batch_length]}, ) # slice latents to original batch length
+            out["noise_mask"] = noise_mask[:batch_length]
+        return (out, )
 
 
 class ImageGridCompose:
