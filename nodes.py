@@ -115,6 +115,13 @@ def calc_sigma(model, sampler_name, scheduler, steps, start_at_step, end_at_step
     return sigma.cpu().numpy()
 
 
+def rave_prepare_mask(noise_mask, shape):
+    noise_mask = torch.nn.functional.interpolate(noise_mask.reshape((-1, 1, noise_mask.shape[-2], noise_mask.shape[-1])), size=(shape[2] * 8, shape[3] * 8), mode='nearest-exact')
+    noise_mask = torch.cat([noise_mask] * shape[1], dim=1)
+    noise_mask = comfy.utils.repeat_to_batch_size(noise_mask, shape[0])
+    return noise_mask
+
+
 class KSamplerRAVE:
     @classmethod
     def INPUT_TYPES(s):
@@ -148,7 +155,10 @@ class KSamplerRAVE:
         mask_enabled = False
         if "noise_mask" in latent_image:
             mask_enabled = True
-            noise_mask = comfy.utils.repeat_to_batch_size(latent_image["noise_mask"].clone(), batch_length)
+            noise_mask = latent_image["noise_mask"].clone()
+            noise_mask = comfy.sample.prepare_mask(noise_mask, latent.shape, "cpu")
+            noise_mask = (noise_mask > 0).type(noise_mask.dtype)
+            noise_mask = rave_prepare_mask(noise_mask, latent.shape)[:, 0, :, :].unsqueeze(1)
         
         pad = 0
         if pad_grid:
@@ -156,26 +166,50 @@ class KSamplerRAVE:
         
         print("RAVE sampling with %d frames (%d grids)" % (batch_length, math.ceil(batch_length / (grid_size ** 2))))
         
-        # check pos and neg for controlnets
+        # check pos and neg for controlnets and masks
         controlnet_exist = False
+        cond_mask_exists = False
         for conditioning in [positive, negative]:
             for t in conditioning:
                 if 'control' in t[1]:
                     controlnet_exist = True
-        
+                if 'mask' in t[1]:
+                    cond_mask_exists = True
+        #check for condition masks and add them to lists
+        cond_masks_pos = []
+        cond_masks_neg = []
+        if cond_mask_exists:
+            for t in positive:
+                if 'mask' in t[1]:
+                    cond_mask_pos = t[1]['mask']
+                else:
+                    cond_mask_pos = None
+                cond_masks_pos.append(cond_mask_pos)
+            for t in negative:
+                if 'mask' in t[1]:
+                    cond_mask_neg = t[1]['mask']
+                else:
+                    cond_mask_neg = None
+                cond_masks_neg.append(cond_mask_neg)
+
         # get list of controlnet objs and images
         control_objs = []
         control_images = []
+        control_masks = []
         if controlnet_exist:
             for t in positive:
                 control = t[1]['control']
                 control_objs.append(control)
                 control_images.append(control.cond_hint_original)
-                
+                if hasattr(control, 'mask_cond_hint_original'):
+                    control_masks.append(control.mask_cond_hint_original)
+
                 prev = control.previous_controlnet
                 while prev != None:
                     control_objs.append(prev)
                     control_images.append(prev.cond_hint_original)
+                    if hasattr(control, 'mask_cond_hint_original'):
+                        control_masks.append(prev.mask_cond_hint_original)
                     prev = prev.previous_controlnet
         
         # add random noise if enabled
@@ -194,7 +228,7 @@ class KSamplerRAVE:
             # grid latents in random arrangement
             grid = {"samples": grid_compose(latent.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)}
             
-            # grid mask if it exists
+            # grid latent mask if it exists
             if mask_enabled:
                 grid["noise_mask"] = grid_compose(noise_mask.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
             
@@ -203,7 +237,25 @@ class KSamplerRAVE:
                 for i in range(len(control_objs)):
                     ctrl_img = grid_compose(control_images[i].movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
                     control_objs[i].set_cond_hint(ctrl_img, control_objs[i].strength, control_objs[i].timestep_percent_range)
-            
+                    # grid controlnet masks and apply
+                    if control_masks:
+                        if control_masks[i] is not None:
+                            ctrl_mask = grid_compose(control_masks[i].unsqueeze(1).movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
+                            control_objs[i].set_cond_hint_mask(ctrl_mask)
+
+            # grid condition masks and apply
+            if cond_mask_exists:
+                for i in range(len(cond_masks_pos)):
+                    if cond_masks_pos[i] is not None:
+                        cmask_pos = grid_compose(cond_masks_pos[i].unsqueeze(1).movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
+                        cmask_pos = cmask_pos[:, 0, :, :]
+                        positive[i][1]['mask'] = cmask_pos
+                for i in range(len(cond_masks_neg)):
+                    if cond_masks_neg[i] is not None:
+                        cmask_neg = grid_compose(cond_masks_neg[i].unsqueeze(1).movedim(1,3), grid_size, True, seed, pad*8).movedim(-1,1)
+                        cmask_neg = cmask_neg[:, 0, :, :]
+                        negative[i][1]['mask'] = cmask_neg
+
             # sample 1 step
             start = start_at_step + step
             end = start + 1
@@ -211,11 +263,6 @@ class KSamplerRAVE:
             
             # ungrid latents and increment seed to shuffle grids with a different arrangement on the next step
             latent = grid_decompose(result[0]["samples"].movedim(1,3), grid_size, True, seed, pad).movedim(-1,1)
-            if mask_enabled:
-                grid_diff = torch.max(torch.abs(result[0]["samples"] - grid["samples"]) ** 2, 1, keepdim=True)[0]
-                grid_diff = torch.nn.functional.interpolate(grid_diff, size=(grid_diff.size(2) * 8, grid_diff.size(3) * 8), mode="bilinear")
-                grid_diff = torch.clamp((grid_diff - 0.0001) * 10000, min=0, max=1)
-                noise_mask = torch.maximum(grid_decompose(grid_diff.movedim(1,3), grid_size, True, seed, pad).movedim(-1,1), noise_mask)
             
             seed += 1
             pbar.update(1)
@@ -224,7 +271,20 @@ class KSamplerRAVE:
         if controlnet_exist:
             for i in range(len(control_objs)):
                 control_objs[i].set_cond_hint(control_images[i], control_objs[i].strength, control_objs[i].timestep_percent_range)
-        
+                if control_masks:
+                    if control_masks[i] is not None:
+                        control_objs[i].set_cond_hint_mask(control_masks[i])
+                    
+        # restore original condition masks
+        if cond_mask_exists:
+            for i in range(len(cond_masks_pos)):
+                if cond_masks_pos[i] is not None:
+                    positive[i][1]['mask'] = cond_masks_pos[i]
+            for i in range(len(cond_masks_neg)):
+                if cond_masks_neg[i] is not None:
+                    negative[i][1]['mask'] = cond_masks_neg[i]
+
+
         if mask_enabled:
             return ({"samples":latent[:batch_length], "noise_mask":noise_mask[:batch_length]}, ) # slice latents to original batch length
         return ({"samples":latent[:batch_length]}, ) # slice latents to original batch length
