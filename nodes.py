@@ -156,13 +156,9 @@ class KSamplerRAVE:
         if "noise_mask" in latent_image:
             mask_enabled = True
             noise_mask = latent_image["noise_mask"].clone()
-            print(noise_mask.shape)
             noise_mask = comfy.sample.prepare_mask(noise_mask, latent.shape, "cpu")[:, 0, :, :].unsqueeze(1)
-            print(noise_mask.shape)
             noise_mask = (noise_mask > 0).type(noise_mask.dtype)
-            print(noise_mask.shape)
             noise_mask = rave_prepare_mask(noise_mask, latent.shape)[:, 0, :, :].unsqueeze(1)
-            print(noise_mask.shape)
         
         pad = 0
         if pad_grid:
